@@ -1,0 +1,446 @@
+# ==============================================================================
+# CKLab v1.0 — Integrated: primitives + NL + Thom–Porteous + planes + PSLQ
+# ==============================================================================
+
+from sage.all import *
+
+# --------------------------
+# Jacobian ring core
+# --------------------------
+
+def _monomial_basis(R, deg):
+    return list(R.monomials_of_degree(deg))
+
+def _nf_poly(I, poly):
+    try:
+        return I.normal_form(poly)
+    except Exception:
+        GB = I.groebner_basis()
+        return poly.reduce(GB)
+
+def _poly_to_vec(poly, mons, mon_index):
+    v = vector(QQ, len(mons))
+    if poly == 0:
+        return v
+    for a in poly.monomials():
+        idx = mon_index[a]
+        v[idx] += poly.coefficient(a)
+    return v
+
+class HypersurfaceJacobian:
+    """
+    Smooth hypersurface X={f=0} ⊂ P^{n+1} of degree d over QQ.
+    Exact: graded bases of S=R/J, residue pairing, primitive projectors, NL rank.
+    """
+    def __init__(self, n, d, f=None, names=None, order='degrevlex'):
+        self.n = int(n)
+        self.d = int(d)
+        N = self.n + 2
+        if names is None:
+            names = [f'x{i}' for i in range(N)]
+        self.R = PolynomialRing(QQ, N, order=order, names=names)
+        self.xs = self.R.gens()
+        self.f = sum(x**d for x in self.xs) if f is None else self.R(f)
+        self.J = self.R.ideal([self.f.derivative(x) for x in self.xs])
+        self._deg_cache = {}
+        self._socle_deg = (self.n + 2) * (self.d - 2)
+
+    @property
+    def socle_degree(self):
+        return self._socle_deg
+
+    def graded_basis(self, deg):
+        if deg in self._deg_cache:
+            return self._deg_cache[deg]
+        R, J = self.R, self.J
+        mons = _monomial_basis(R, deg)
+        mon_index = {m:i for i,m in enumerate(mons)}
+        cols, NF_polys = [], []
+        for m in mons:
+            q = _nf_poly(J, m)
+            NF_polys.append(q)
+            cols.append(_poly_to_vec(q, mons, mon_index))
+        M = matrix(QQ, cols).transpose()
+        E = M.echelon_form()
+        piv = E.pivots()
+        if len(piv) == 0:
+            basis_mat = matrix(QQ, len(mons), 0)
+            basis_polys, dim = [], 0
+        else:
+            basis_mat = M[:, piv]
+            basis_polys = [NF_polys[j] for j in piv]
+            dim = len(piv)
+        data = {
+            'mons': mons, 'mon_index': mon_index,
+            'basis_mat': basis_mat, 'basis_polys': basis_polys, 'dim': dim
+        }
+        self._deg_cache[deg] = data
+        return data
+
+    def coords_in_deg(self, deg, poly):
+        data = self.graded_basis(deg)
+        dim = data['dim']
+        if dim == 0:
+            return vector(QQ, 0)
+        mons = data['mons']
+        mon_index = data['mon_index']
+        B = data['basis_mat']
+        v = _poly_to_vec(_nf_poly(self.J, poly), mons, mon_index)
+        x = B.solve_right(v)
+        return x
+
+    def multiplication_matrix(self, deg_from, g, check=True):
+        g = self.R(g); t = g.total_degree()
+        data_from = self.graded_basis(deg_from)
+        data_to   = self.graded_basis(deg_from + t)
+        m_from = data_from['dim']; m_to = data_to['dim']
+        if m_from == 0 or m_to == 0:
+            return matrix(QQ, m_to, m_from)
+        cols = []
+        for b in data_from['basis_polys']:
+            q = _nf_poly(self.J, b * g)
+            x_to = self.coords_in_deg(deg_from + t, q)
+            cols.append(x_to)
+        M = matrix(QQ, cols).transpose()
+        if check:
+            import random
+            for _ in range(2):
+                coeffs = [QQ(random.randint(-2,2)) for _ in range(m_from)]
+                comb = sum(coeffs[j]*data_from['basis_polys'][j] for j in range(m_from))
+                lhs = self.coords_in_deg(deg_from + t, _nf_poly(self.J, comb * g))
+                rhs = M * vector(QQ, coeffs)
+                if lhs != rhs:
+                    raise ValueError("Multiplication matrix consistency failed.")
+        return M
+
+    # Griffiths index
+    def griffiths_m(self, p):
+        m = (p+1)*self.d - (self.n + 2)
+        return m if m >= 0 else -1
+
+    # Residue pairing S_m × S_{s-m} → S_s ≅ Q
+    def residue_pairing(self, m):
+        s = self.socle_degree
+        Bm = self.graded_basis(m); Bn = self.graded_basis(s - m); Bs = self.graded_basis(s)
+        if Bs['dim'] != 1:
+            raise ValueError("S_s must be 1-dimensional.")
+        def phi(poly_s): return self.coords_in_deg(s, poly_s)[0]
+        G = matrix(QQ, Bm['dim'], Bn['dim'])
+        for i, a in enumerate(Bm['basis_polys']):
+            for j, b in enumerate(Bn['basis_polys']):
+                G[i,j] = phi(_nf_poly(self.J, a*b))
+        return G, phi
+
+    # Middle projectors (even n)
+    def mid_even_projectors(self):
+        if self.n % 2 != 0:
+            raise ValueError("Middle-degree projector only for even n.")
+        mid = self.n//2
+        m = self.griffiths_m(mid)
+        dim_prim = self.graded_basis(m)['dim'] if m >= 0 else 0
+        total_dim = 1 + dim_prim
+        P_lef = matrix(QQ, total_dim, total_dim, 0); P_lef[0,0] = 1
+        P_prim = matrix(QQ, total_dim, total_dim, 0)
+        if dim_prim > 0: P_prim[1:,1:] = matrix.identity(QQ, dim_prim)
+        labels = [f'h^{mid}'] + [f'v{j}' for j in range(dim_prim)]
+        return {'basis': labels, 'P_lef': P_lef, 'P_prim': P_prim, 'dims': (1, dim_prim)}
+
+    # Infinitesimal NL rank
+    def nl_tangent_codim(self, v_coords=None, p=None):
+        if self.n % 2 != 0:
+            raise ValueError("Defined for middle piece (n even).")
+        mid = self.n//2
+        if p is None: p = mid
+        m = self.griffiths_m(p)
+        if m < 0: return 0
+        D = self.graded_basis(self.d)['dim']; T = self.graded_basis(m + self.d)['dim']
+        if D == 0 or T == 0: return 0
+        if v_coords is None:
+            basis_m = self.graded_basis(m)['basis_polys']
+            if len(basis_m) == 0: return 0
+            v_poly = basis_m[0]
+        else:
+            basis_m = self.graded_basis(m)['basis_polys']
+            v_poly = sum(v_coords[i]*basis_m[i] for i in range(len(basis_m)))
+        basis_d = self.graded_basis(self.d)['basis_polys']
+        cols = []
+        for g in basis_d:
+            q = _nf_poly(self.J, v_poly * g)
+            x_to = self.coords_in_deg(m + self.d, q)
+            cols.append(x_to)
+        M = matrix(QQ, cols).transpose()
+        return M.rank()
+
+# --------------------------
+# Thom–Porteous on P^N and restriction to X
+# --------------------------
+
+def total_chern_bundle(line_degs, h, sign=+1):
+    c = 1
+    for a in line_degs:
+        c *= (1 + sign*QQ(a)*h)
+    return c
+
+def thom_porteous_rank_leq_r_class(E_degs, F_degs, r, N):
+    R = PolynomialRing(QQ, 'h'); h = R.gen()
+    e = len(E_degs); f = len(F_degs)
+    cFE = total_chern_bundle(F_degs, h, +1) / total_chern_bundle(E_degs, h, +1)
+    cFE_series = R(cFE).truncate(N+1)
+    c = [QQ(0)]*(N+1)
+    for k in range(0, N+1):
+        c[k] = cFE_series.list()[k] if k < len(cFE_series.list()) else QQ(0)
+    rows = f - r; cols = e - r
+    if rows <= 0 or cols <= 0:
+        return R(1)
+    M = matrix(R, rows, cols)
+    for i in range(rows):
+        for j in range(cols):
+            idx = (j - i) + r
+            M[i,j] = c[idx] if (0 <= idx <= N) else R(0)
+    det = R(M.det()).truncate(N+1)
+    return det
+
+def restrict_class_to_hypersurface(class_in_PN, N, dX):
+    R = PolynomialRing(QQ, 'h'); h = R.gen()
+    return R(class_in_PN).truncate(N)  # dim(X)=N-1
+
+# --------------------------
+# Fermat cubic fourfold helpers (planes → S3)
+# --------------------------
+
+def is_fermat_cubic_fourfold(H):
+    R = H.R
+    xs = H.xs
+    f0 = sum(x**H.d for x in xs)
+    return R(H.f) == f0 and (H.n == 4 and H.d == 3)
+
+def s3_basis_info(H):
+    B = H.graded_basis(3)
+    basis = B['basis_polys']
+    supports = []
+    for m in basis:
+        if len(m.monomials()) != 1:
+            raise ValueError("Non-monomial basis element found; use Fermat/diagonal basis.")
+        mono = m.monomials()[0]
+        exps = mono.exponents()[0]
+        supp = tuple([i for i,e in enumerate(exps) if e == 1])
+        if len(supp) != 3:
+            raise ValueError("Expected squarefree degree-3 monomial.")
+        supports.append(supp)
+    index_by_support = {supp:i for i,supp in enumerate(supports)}
+    return basis, supports, index_by_support
+
+def all_perfect_matchings_on_6():
+    # Return all perfect matchings (pairings) of {0,1,2,3,4,5} as sorted tuples of pairs
+    import itertools
+    S = list(range(6))
+    matchings = set()
+    for pairs in itertools.permutations(S, 6):
+        pairs = [(pairs[0],pairs[1]),(pairs[2],pairs[3]),(pairs[4],pairs[5])]
+        # sort each pair and the list of pairs
+        pairs = tuple(sorted(tuple(sorted(p)) for p in pairs))
+        matchings.add(pairs)
+    return sorted(matchings)
+
+def fermat_plane_vectors_in_S3_all_pairings(H):
+    """
+    For Fermat cubic: generate plane primitive vectors across all perfect matchings
+    and all choices of cube roots of -1 on each pair.
+    """
+    if not is_fermat_cubic_fourfold(H):
+        raise NotImplementedError("This generator is for the Fermat cubic fourfold.")
+    K = CyclotomicField(6)
+    z6 = K.gen()
+    roots = [K(-1), z6, z6**5]  # all solutions of z^3=-1
+    basis, supports, index_by_support = s3_basis_info(H)
+    planes = []
+    for matching in all_perfect_matchings_on_6():
+        # assign z to the second index of each pair (like x_a = z * x_b)
+        for z1 in roots:
+            for z2 in roots:
+                for z3 in roots:
+                    z_by_index = {}
+                    (a1,b1),(a2,b2),(a3,b3) = matching
+                    z_by_index[b1] = z1
+                    z_by_index[b2] = z2
+                    z_by_index[b3] = z3
+                    coeffs = [K(0)]*len(supports)
+                    for idx, T in enumerate(supports):
+                        c = K(1)
+                        for t in T:
+                            if t in z_by_index:
+                                c *= z_by_index[t]
+                        coeffs[idx] = c
+                    vK = vector(K, coeffs)
+                    label = f"Plane{matching}(z={z1},{z2},{z3})"
+                    planes.append({'vecK': vK, 'label': label, 'matching': matching, 'z': (z1,z2,z3)})
+    return planes
+
+# --------------------------
+# Mapping and PSLQ integration
+# --------------------------
+
+def primitive_poly_to_cohomology_vector(prim_poly, H):
+    # Exact coordinates in S_3 basis (QQ^20)
+    return H.coords_in_deg(3, prim_poly)
+
+def compute_candidate_span_rank(candidates):
+    if len(candidates) == 0: return 0, 0, 0
+    K = candidates[0]['vecK'].base_ring()
+    m = len(candidates[0]['vecK'])
+    N = len(candidates)
+    MK = matrix(K, m, N, [x for v in candidates for x in v['vecK']])
+    return MK.rank(), m, N
+
+def robust_pslq_search(alpha_Q, candidate_dicts, max_prec=800, start_prec=160, trials=8, tol_exp=40):
+    """
+    Find rational coefficients c_j with alpha = Σ c_j v_j, where v_j ∈ K^m (K=Q(ζ_6) here).
+    Strategy:
+      - Exact solve over K first; accept only QQ coefficients.
+      - Else PSLQ ladder with stability across two successive precisions, then exact back-check over K.
+    Returns dict {j: c_j ∈ QQ} or None.
+    """
+    if len(candidate_dicts) == 0: return None
+    K = candidate_dicts[0]['vecK'].base_ring()
+    candidatesK = [cd['vecK'] for cd in candidate_dicts]
+    m = len(alpha_Q); N = len(candidatesK)
+    alphaK = vector(K, [K(a) for a in alpha_Q])
+
+    # Try exact solve over K
+    MK = matrix(K, m, N, [x for v in candidatesK for x in v])
+    try:
+        solK = MK.solve_right(alphaK) if MK.rank() == m else None
+        if solK is not None:
+            coeffs_Q = []
+            ok = True
+            for c in solK:
+                try:
+                    coeffs_Q.append(QQ(c))
+                except Exception:
+                    ok = False; break
+            if ok:
+                return {j: coeffs_Q[j] for j in range(N) if coeffs_Q[j] != 0}
+    except Exception:
+        pass
+
+    # PSLQ ladder
+    def embedK(vK, prec):
+        CCp = ComplexField(prec)
+        return vector(CCp, [CCp(x) for x in vK])
+
+    stable = None
+    for prec in [start_prec, start_prec*2, start_prec*4]:
+        CCp = ComplexField(prec)
+        colsC = [embedK(v, prec) for v in (candidatesK + [(-alphaK)])]
+        rel_found = None
+        for _ in range(trials):
+            # random rational weights in projection
+            r = vector(QQ, m, [QQ(randrange(-2,3)) for _ in range(m)])
+            if all(ci == 0 for ci in r): r = vector(QQ, m, [1] + [0]*(m-1))
+            scalars = [sum(r[i] * col[i] for i in range(m)) for col in colsC]
+            RRp = RealField(prec)
+            real_list = []
+            for z in scalars:
+                real_list.extend([RRp(z.real()), RRp(z.imag())])
+            rel = pslq(real_list, maxcoeff=10**7)
+            if rel is None: continue
+            # compress pairs (Re,Im)
+            coeffs = []
+            ok = True
+            for j in range(N+1):
+                a = rel[2*j]; b = rel[2*j+1]
+                if a != b and (abs(a)+abs(b) != 0):
+                    ok = False; break
+                coeffs.append(Integer(a))
+            if not ok: continue
+            # verify numeric residual
+            lhs = vector(CCp, [CCp(0) for _ in range(m)])
+            for j in range(N+1):
+                lhs += coeffs[j] * colsC[j]
+            if max(abs(z) for z in lhs) < CCp(10)**(-tol_exp):
+                rel_found = coeffs; break
+        if rel_found is not None:
+            if stable is not None and rel_found == stable:
+                # interpret relation
+                cN = rel_found[-1]
+                if cN == 0: return None
+                coeffs_rat = [QQ(-rel_found[j]) / QQ(cN) for j in range(N)]
+                # exact back-check over K
+                lhsK = sum(coeffs_rat[j]*candidatesK[j] for j in range(N))
+                if lhsK == alphaK:
+                    return {j: coeffs_rat[j] for j in range(N) if coeffs_rat[j] != 0}
+                # try rational reconstruction
+                den = lcm([c.denominator() for c in coeffs_rat])
+                if sum((den*candidatesK[j])*coeffs_rat[j] for j in range(N)) == den*alphaK:
+                    return {j: coeffs_rat[j] for j in range(N) if coeffs_rat[j] != 0}
+                return None
+            stable = rel_found
+    return None
+
+# --------------------------
+# Test drivers
+# --------------------------
+
+def test_primitive_hodge_conjecture(variety_type="cubic_fermat", max_prim=5, pairing_mode="all"):
+    if variety_type != "cubic_fermat":
+        raise NotImplementedError("Currently wired for Fermat cubic fourfold; extend similarly for others.")
+    print("Initializing Fermat cubic fourfold Jacobian ring...")
+    H = HypersurfaceJacobian(n=4, d=3)  # Fermat by default
+    assert is_fermat_cubic_fourfold(H), "Expected Fermat cubic fourfold."
+    B = H.graded_basis(3)
+    primitive_classes = B['basis_polys']
+    print(f"S_3 dimension = {len(primitive_classes)} (expect 20).")
+    # candidates
+    if pairing_mode == "one":
+        candidates = fermat_plane_vectors_in_S3_all_pairings(H)[:27]
+    else:
+        candidates = fermat_plane_vectors_in_S3_all_pairings(H)
+    rank, m, N = compute_candidate_span_rank(candidates)
+    print(f"Generated {len(candidates)} plane candidates; span rank over K: {rank}/{m}")
+    successes = 0
+    for i, prim_poly in enumerate(primitive_classes[:max_prim]):
+        alpha_Q = primitive_poly_to_cohomology_vector(prim_poly, H)  # QQ^20
+        relation = robust_pslq_search(alpha_Q, candidates, start_prec=160, tol_exp=40)
+        if relation:
+            successes += 1
+            terms = [f"({QQ(c)})*{candidates[j]['label']}" for j,c in relation.items()]
+            print(f"[OK] Primitive basis element {i} expressed as:")
+            print("     ", " + ".join(terms))
+        else:
+            print(f"[..] Primitive basis element {i}: no certified relation from current candidates.")
+    print(f"Summary: {successes}/{max_prim} primitive basis vectors expressed via planes.")
+
+def run_basic_tests():
+    """
+    Smoke + integration checks
+    """
+    import time
+    t0 = time.time()
+    print("=== CKLab basic integration tests ===")
+    try:
+        H = HypersurfaceJacobian(n=4, d=3)  # Fermat
+        dim_S3 = H.graded_basis(3)['dim']
+        dim_S6 = H.graded_basis(6)['dim']
+        assert dim_S3 == 20 and dim_S6 == 1, f"Unexpected dims: S3={dim_S3}, S6={dim_S6}"
+        P = H.mid_even_projectors()
+        assert P['P_lef']*P['P_lef'] == P['P_lef']
+        assert P['P_prim']*P['P_prim'] == P['P_prim']
+        assert P['P_lef']*P['P_prim'] == 0
+        codim = H.nl_tangent_codim()
+        assert codim == 1
+        print(f"[OK] Jacobian + projectors + NL: dim S3=20, dim S6=1, NL codim={codim}")
+    except Exception as e:
+        print("[FAIL] Jacobian/NL basic check:", e)
+        return False
+    try:
+        test_primitive_hodge_conjecture(max_prim=3, pairing_mode="all")
+    except Exception as e:
+        print("[FAIL] PSLQ test driver crashed:", e)
+        return False
+    dt = time.time() - t0
+    print(f"=== Basic tests completed in {dt:.2f}s ===")
+    return True
+
+# Optional autorun
+if __name__ == "__main__":
+    run_basic_tests()
